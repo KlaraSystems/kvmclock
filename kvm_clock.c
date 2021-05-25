@@ -49,6 +49,7 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
+#include <machine/bus.h>
 #include <machine/pvclock.h>
 #include <x86/kvm.h>
 
@@ -63,24 +64,41 @@ __FBSDID("$FreeBSD$");
 #define	KVM_CLOCK_TC_QUALITY		975
 
 struct kvm_clock_softc {
-	struct pvclock_softc		 pvcsc;
+	struct pvclock			 pvc;
 	struct pvclock_wall_clock	 wc;
 	struct pvclock_vcpu_time_info	*timeinfos;
+	bus_dmamap_t			 timeinfos_dmamap;
+	bus_dma_tag_t			 timeinfos_dmatag;
 	u_int				 msr_tc;
 	u_int				 msr_wc;
 };
 
 static devclass_t	kvm_clock_devclass;
 
-static void		kvm_clock_system_time_enable(struct kvm_clock_softc *sc);
-static void		kvm_clock_system_time_enable_pcpu(void *arg);
+static struct pvclock_vcpu_time_info *kvm_clock_get_curcpu_timeinfo(void *arg);
+static struct pvclock_wall_clock *kvm_clock_get_wallclock(void *arg);
+static void	kvm_clock_system_time_enable(struct kvm_clock_softc *sc);
+static void	kvm_clock_system_time_enable_pcpu(void *arg);
+static int	kvm_clock_timeinfos_alloc(struct kvm_clock_softc *sc);
+static void	kvm_clock_timeinfos_alloc_cb(void *timeinfos,
+    bus_dma_segment_t *segs, int nseg, int error);
 
-static inline struct pvclock_vcpu_time_info *
+static struct pvclock_vcpu_time_info *
 kvm_clock_get_curcpu_timeinfo(void *arg)
 {
 	struct pvclock_vcpu_time_info *timeinfos = arg;
 
 	return (&timeinfos[curcpu]);
+}
+
+static struct pvclock_wall_clock *
+kvm_clock_get_wallclock(void *arg)
+{
+	struct kvm_clock_softc *sc = arg;
+
+	wrmsr(sc->msr_wc, vtophys(&sc->wc));
+
+	return (&sc->wc);
 }
 
 static void
@@ -98,6 +116,69 @@ kvm_clock_system_time_enable_pcpu(void *arg)
 	 * See [2]; the lsb of this MSR is the system time enable bit.
 	 */
 	wrmsr(sc->msr_tc, vtophys(&(sc->timeinfos)[curcpu]) | 1);
+}
+
+static int
+kvm_clock_timeinfos_alloc(struct kvm_clock_softc *sc)
+{
+	bus_size_t size;
+	int err;
+
+	size = round_page(mp_ncpus * sizeof(struct pvclock_vcpu_time_info));
+
+	err = bus_dma_tag_create(NULL, PAGE_SIZE, 0, BUS_SPACE_MAXADDR,
+	    BUS_SPACE_MAXADDR, NULL, NULL, size, size / PAGE_SIZE, PAGE_SIZE, 0,
+	    NULL, NULL, &sc->timeinfos_dmatag);
+	if (err != 0)
+		return (err);
+
+	err = bus_dmamem_alloc(sc->timeinfos_dmatag, (void **)&sc->timeinfos,
+	    BUS_DMA_NOWAIT | BUS_DMA_ZERO, &sc->timeinfos_dmamap);
+	if (err != 0) {
+		(void)bus_dma_tag_destroy(sc->timeinfos_dmatag);
+		return (err);
+	}
+
+	err = bus_dmamap_load(sc->timeinfos_dmatag, sc->timeinfos_dmamap,
+	    sc->timeinfos, size, kvm_clock_timeinfos_alloc_cb, sc->timeinfos,
+	    BUS_DMA_NOWAIT);
+	if (err != 0) {
+		bus_dmamem_free(sc->timeinfos_dmatag, sc->timeinfos,
+		    sc->timeinfos_dmamap);
+		(void)bus_dma_tag_destroy(sc->timeinfos_dmatag);
+		return (err);
+	}
+
+	return (0);
+}
+
+static void
+kvm_clock_timeinfos_alloc_cb(void *timeinfos, bus_dma_segment_t *segs,
+    int nseg, int error)
+{
+	vm_paddr_t paddr;
+	int i, npages;
+
+
+	if (error != 0)
+		return;
+
+	npages = round_page(mp_ncpus * sizeof(struct pvclock_vcpu_time_info)) /
+	    PAGE_SIZE;
+
+	KASSERT(nseg == npages, ("num segs %d is not num pages %d", nseg,
+	    npages));
+
+	for (i = 0; i < nseg; i++) {
+		paddr = vtophys((uintptr_t)timeinfos + i * PAGE_SIZE);
+
+		KASSERT((segs[i].ds_addr & PAGE_MASK) == 0, ("Segment %d "
+		    "address %#jx not page-aligned.", i, segs[i].ds_addr));
+		KASSERT(segs[i].ds_len == PAGE_SIZE, ("seg %i has "
+		    "non-page-sized len %ju", i, segs[i].ds_len));
+		KASSERT(paddr == segs[i].ds_addr, ("seg paddr %#jx should be "
+		"vtophys(vaddr) %#jx", segs[i].ds_addr, paddr));
+	}
 }
 
 static void
@@ -128,6 +209,7 @@ kvm_clock_attach(device_t dev)
 {
 	u_int regs[4];
 	struct kvm_clock_softc *sc;
+	int err;
 	bool stable_flag_supported;
 
 	sc = device_get_softc(dev);
@@ -147,27 +229,25 @@ kvm_clock_attach(device_t dev)
 	    ((regs[0] & KVM_FEATURE_CLOCKSOURCE_STABLE_BIT) != 0);
 
 	/* Set up 'struct pvclock_vcpu_time_info' page(s): */
-	sc->timeinfos = contigmalloc(round_page(mp_ncpus *
-	    sizeof(struct pvclock_vcpu_time_info)), M_DEVBUF, M_ZERO | M_NOWAIT,
-	    0, ~0, PAGE_SIZE, 0);
-	if (sc->timeinfos == NULL)
-		return (ENOMEM);
+	err = kvm_clock_timeinfos_alloc(sc);
+	if (err != 0)
+		return (err);
 
 	kvm_clock_system_time_enable(sc);
 
 	/*
-	 * Init pvclock softc:
+	 * Init pvclock; register KVM clock wall clock, register KVM clock
+	 * timecounter, and set up the requisite infrastructure for vDSO access
+	 * to this timecounter.
 	 *     Regarding 'tc_flags': Since the KVM MSR documentation does not
 	 *     specifically discuss suspend/resume scenarios, conservatively
-	 *     leave 'TC_FLAGS_SUSPEND_SAFE' cleared and assume the system time
-	 *     must be re-inited in such cases.
+	 *     leave 'TC_FLAGS_SUSPEND_SAFE' cleared and assume that the system
+	 *     time must be re-inited in such cases.
 	 */
-	pvclock_softc_init(&sc->pvcsc, KVM_CLOCK_DEVNAME, KVM_CLOCK_TC_QUALITY,
-	    0, kvm_clock_get_curcpu_timeinfo, sc->timeinfos, sc->timeinfos,
+	pvclock_init(&sc->pvc, dev, KVM_CLOCK_DEVNAME,
+	    KVM_CLOCK_TC_QUALITY, 0, kvm_clock_get_curcpu_timeinfo,
+	    sc->timeinfos, kvm_clock_get_wallclock, sc, sc->timeinfos,
 	    stable_flag_supported);
-
-	/* Attach pvclock; register KVM clock timecounter and wall clock: */
-	pvclock_attach(dev, &sc->pvcsc);
 
 	return (0);
 }
@@ -179,7 +259,7 @@ kvm_clock_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 
-	return (pvclock_detach(dev, &sc->pvcsc));
+	return (pvclock_destroy(&sc->pvc));
 }
 
 static int
@@ -191,6 +271,11 @@ kvm_clock_suspend(device_t dev)
 static int
 kvm_clock_resume(device_t dev)
 {
+	/*
+	 * See note in 'kvm_clock_attach()' regarding 'TC_FLAGS_SUSPEND_SAFE';
+	 * conservatively assume that the system time must be re-inited in
+	 * suspend/resume scenarios.
+	 */
 	kvm_clock_system_time_enable(device_get_softc(dev));
 	pvclock_resume();
 	inittodr(time_second);
@@ -201,22 +286,11 @@ kvm_clock_resume(device_t dev)
 static int
 kvm_clock_gettime(device_t dev, struct timespec *ts)
 {
-	struct timespec system_ts;
-	uint64_t system_nsec;
 	struct kvm_clock_softc *sc;
 
 	sc = device_get_softc(dev);
 
-	critical_enter();
-	wrmsr(sc->msr_wc, vtophys(&sc->wc));
-	pvclock_get_wallclock(&sc->wc, ts);
-	system_nsec = pvclock_get_timecount(&(sc->timeinfos)[curcpu]);
-	critical_exit();
-
-	system_ts.tv_sec = system_nsec / 1000000000ULL;
-	system_ts.tv_nsec = system_nsec % 1000000000ULL;
-
-	timespecadd(ts, &system_ts, ts);
+	pvclock_gettime(&sc->pvc, ts);
 
 	return (0);
 }

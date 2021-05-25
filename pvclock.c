@@ -260,7 +260,11 @@ pvclock_cdev_mmap(struct cdev *dev, vm_ooffset_t offset, vm_paddr_t *paddr,
 	if (offset != 0)
 		return (EINVAL);
 
+#ifdef PROT_EXTRACT
 	if (PROT_EXTRACT(nprot) != PROT_READ)
+#else
+	if (nprot != PROT_READ)
+#endif
 		return (EINVAL);
 
 	*paddr = vtophys(dev->si_drv1);

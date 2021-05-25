@@ -63,9 +63,14 @@
 static inline bool
 kvm_cpuid_features_leaf_supported(void)
 {
+#if __FreeBSD_version >= 1300029
 	return (vm_guest == VM_GUEST_KVM &&
 	    KVM_CPUID_FEATURES_LEAF > hv_base &&
 	    KVM_CPUID_FEATURES_LEAF <= hv_high);
+#else
+	return (vm_guest == VM_GUEST_KVM &&
+	    KVM_CPUID_FEATURES_LEAF <= hv_high);
+#endif
 }
 
 static inline void

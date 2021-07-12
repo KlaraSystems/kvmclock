@@ -41,6 +41,7 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/domainset.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
@@ -49,7 +50,6 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
-#include <machine/bus.h>
 #include <machine/pvclock.h>
 #include <x86/kvm.h>
 
@@ -67,8 +67,6 @@ struct kvm_clock_softc {
 	struct pvclock			 pvc;
 	struct pvclock_wall_clock	 wc;
 	struct pvclock_vcpu_time_info	*timeinfos;
-	bus_dmamap_t			 timeinfos_dmamap;
-	bus_dma_tag_t			 timeinfos_dmatag;
 	u_int				 msr_tc;
 	u_int				 msr_wc;
 };
@@ -79,9 +77,6 @@ static struct pvclock_vcpu_time_info *kvm_clock_get_curcpu_timeinfo(void *arg);
 static struct pvclock_wall_clock *kvm_clock_get_wallclock(void *arg);
 static void	kvm_clock_system_time_enable(struct kvm_clock_softc *sc);
 static void	kvm_clock_system_time_enable_pcpu(void *arg);
-static int	kvm_clock_timeinfos_alloc(struct kvm_clock_softc *sc);
-static void	kvm_clock_timeinfos_alloc_cb(void *timeinfos,
-    bus_dma_segment_t *segs, int nseg, int error);
 
 static struct pvclock_vcpu_time_info *
 kvm_clock_get_curcpu_timeinfo(void *arg)
@@ -97,7 +92,6 @@ kvm_clock_get_wallclock(void *arg)
 	struct kvm_clock_softc *sc = arg;
 
 	wrmsr(sc->msr_wc, vtophys(&sc->wc));
-
 	return (&sc->wc);
 }
 
@@ -118,69 +112,6 @@ kvm_clock_system_time_enable_pcpu(void *arg)
 	wrmsr(sc->msr_tc, vtophys(&(sc->timeinfos)[curcpu]) | 1);
 }
 
-static int
-kvm_clock_timeinfos_alloc(struct kvm_clock_softc *sc)
-{
-	bus_size_t size;
-	int err;
-
-	size = round_page(mp_ncpus * sizeof(struct pvclock_vcpu_time_info));
-
-	err = bus_dma_tag_create(NULL, PAGE_SIZE, 0, BUS_SPACE_MAXADDR,
-	    BUS_SPACE_MAXADDR, NULL, NULL, size, size / PAGE_SIZE, PAGE_SIZE, 0,
-	    NULL, NULL, &sc->timeinfos_dmatag);
-	if (err != 0)
-		return (err);
-
-	err = bus_dmamem_alloc(sc->timeinfos_dmatag, (void **)&sc->timeinfos,
-	    BUS_DMA_NOWAIT | BUS_DMA_ZERO, &sc->timeinfos_dmamap);
-	if (err != 0) {
-		(void)bus_dma_tag_destroy(sc->timeinfos_dmatag);
-		return (err);
-	}
-
-	err = bus_dmamap_load(sc->timeinfos_dmatag, sc->timeinfos_dmamap,
-	    sc->timeinfos, size, kvm_clock_timeinfos_alloc_cb, sc->timeinfos,
-	    BUS_DMA_NOWAIT);
-	if (err != 0) {
-		bus_dmamem_free(sc->timeinfos_dmatag, sc->timeinfos,
-		    sc->timeinfos_dmamap);
-		(void)bus_dma_tag_destroy(sc->timeinfos_dmatag);
-		return (err);
-	}
-
-	return (0);
-}
-
-static void
-kvm_clock_timeinfos_alloc_cb(void *timeinfos, bus_dma_segment_t *segs,
-    int nseg, int error)
-{
-	vm_paddr_t paddr;
-	int i, npages;
-
-
-	if (error != 0)
-		return;
-
-	npages = round_page(mp_ncpus * sizeof(struct pvclock_vcpu_time_info)) /
-	    PAGE_SIZE;
-
-	KASSERT(nseg == npages, ("num segs %d is not num pages %d", nseg,
-	    npages));
-
-	for (i = 0; i < nseg; i++) {
-		paddr = vtophys((uintptr_t)timeinfos + i * PAGE_SIZE);
-
-		KASSERT((segs[i].ds_addr & PAGE_MASK) == 0, ("Segment %d "
-		    "address %#jx not page-aligned.", i, segs[i].ds_addr));
-		KASSERT(segs[i].ds_len == PAGE_SIZE, ("seg %i has "
-		    "non-page-sized len %ju", i, segs[i].ds_len));
-		KASSERT(paddr == segs[i].ds_addr, ("seg paddr %#jx should be "
-		"vtophys(vaddr) %#jx", segs[i].ds_addr, paddr));
-	}
-}
-
 static void
 kvm_clock_identify(driver_t *driver, device_t parent)
 {
@@ -190,10 +121,8 @@ kvm_clock_identify(driver_t *driver, device_t parent)
 	if ((regs[0] & KVM_FEATURE_CLOCKSOURCE2) == 0 &&
 	    (regs[0] & KVM_FEATURE_CLOCKSOURCE) == 0)
 		return;
-
 	if (device_find_child(parent, KVM_CLOCK_DEVNAME, -1))
 		return;
-
 	BUS_ADD_CHILD(parent, 0, KVM_CLOCK_DEVNAME, 0);
 }
 
@@ -208,11 +137,8 @@ static int
 kvm_clock_attach(device_t dev)
 {
 	u_int regs[4];
-	struct kvm_clock_softc *sc;
-	int err;
+	struct kvm_clock_softc *sc = device_get_softc(dev);
 	bool stable_flag_supported;
-
-	sc = device_get_softc(dev);
 
 	/* Process KVM "features" CPUID leaf content: */
 	kvm_cpuid_get_features(regs);
@@ -224,15 +150,13 @@ kvm_clock_attach(device_t dev)
 		sc->msr_wc = KVM_MSR_WALL_CLOCK;
 	} else
 		return (ENXIO);
-
 	stable_flag_supported =
 	    ((regs[0] & KVM_FEATURE_CLOCKSOURCE_STABLE_BIT) != 0);
 
 	/* Set up 'struct pvclock_vcpu_time_info' page(s): */
-	err = kvm_clock_timeinfos_alloc(sc);
-	if (err != 0)
-		return (err);
-
+	sc->timeinfos = malloc_domainset_aligned(round_page(mp_ncpus *
+	    sizeof(struct pvclock_vcpu_time_info)), PAGE_SIZE, M_DEVBUF,
+	    DOMAINSET_RR(), M_WAITOK | M_ZERO);
 	kvm_clock_system_time_enable(sc);
 
 	/*
@@ -244,20 +168,20 @@ kvm_clock_attach(device_t dev)
 	 *     leave 'TC_FLAGS_SUSPEND_SAFE' cleared and assume that the system
 	 *     time must be re-inited in such cases.
 	 */
-	pvclock_init(&sc->pvc, dev, KVM_CLOCK_DEVNAME,
-	    KVM_CLOCK_TC_QUALITY, 0, kvm_clock_get_curcpu_timeinfo,
-	    sc->timeinfos, kvm_clock_get_wallclock, sc, sc->timeinfos,
-	    stable_flag_supported);
-
+	sc->pvc.get_curcpu_ti = kvm_clock_get_curcpu_timeinfo;
+	sc->pvc.get_curcpu_ti_arg = sc->timeinfos;
+	sc->pvc.get_wallclock = kvm_clock_get_wallclock;
+	sc->pvc.get_wallclock_arg = sc;
+	sc->pvc.ti_vcpu0_page = sc->timeinfos;
+	sc->pvc.stable_flag_supported = stable_flag_supported;
+	pvclock_init(&sc->pvc, dev, KVM_CLOCK_DEVNAME, KVM_CLOCK_TC_QUALITY, 0);
 	return (0);
 }
 
 static int
 kvm_clock_detach(device_t dev)
 {
-	struct kvm_clock_softc *sc;
-
-	sc = device_get_softc(dev);
+	struct kvm_clock_softc *sc = device_get_softc(dev);
 
 	return (pvclock_destroy(&sc->pvc));
 }
@@ -279,19 +203,15 @@ kvm_clock_resume(device_t dev)
 	kvm_clock_system_time_enable(device_get_softc(dev));
 	pvclock_resume();
 	inittodr(time_second);
-
 	return (0);
 }
 
 static int
 kvm_clock_gettime(device_t dev, struct timespec *ts)
 {
-	struct kvm_clock_softc *sc;
-
-	sc = device_get_softc(dev);
+	struct kvm_clock_softc *sc = device_get_softc(dev);
 
 	pvclock_gettime(&sc->pvc, ts);
-
 	return (0);
 }
 

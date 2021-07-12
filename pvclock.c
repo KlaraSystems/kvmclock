@@ -43,24 +43,8 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
-#include <machine/cpufunc.h>
-#include <machine/cpu.h>
 #include <machine/atomic.h>
 #include <machine/pvclock.h>
-
-/*
- * Note: This is the resolution of the pvclock and not the resolution of the
- * TSC. The former is always 1ns and the pvclock consumer is meant to remain
- * agnostic of the latter, simply using the scaling information provided by the
- * pvclock system time interface to convert TSC-based deltas into nanoseconds.
- */
-#define	PVCLOCK_RESOLUTION_NS	1
-/*
- * Note: Analogous to the note for 'PVCLOCK_RESOLUTION_NS', this is the
- * frequency of the pvclock and is not to be confused with the frequency of the
- * TSC.
- */
-#define	PVCLOCK_FREQUENCY_HZ	1000000000ULL
 
 /*
  * Last time; this guarantees a monotonically increasing clock for when
@@ -89,14 +73,12 @@ static struct cdevsw	 pvclock_cdev_cdevsw = {
 void
 pvclock_resume(void)
 {
-
 	atomic_store_rel_64(&pvclock_last_cycles, 0);
 }
 
 uint64_t
 pvclock_get_last_cycles(void)
 {
-
 	return (atomic_load_acq_64(&pvclock_last_cycles));
 }
 
@@ -106,12 +88,10 @@ pvclock_tsc_freq(struct pvclock_vcpu_time_info *ti)
 	uint64_t freq;
 
 	freq = (1000000000ULL << 32) / ti->tsc_to_system_mul;
-
 	if (ti->tsc_shift < 0)
 		freq <<= -ti->tsc_shift;
 	else
 		freq >>= ti->tsc_shift;
-
 	return (freq);
 }
 
@@ -122,7 +102,6 @@ pvclock_get_timecount(struct pvclock_vcpu_time_info *ti)
 	uint8_t flags;
 
 	pvclock_read_time_info(ti, &now, &flags);
-
 	if (flags & PVCLOCK_FLAG_TSC_STABLE)
 		return (now);
 
@@ -136,7 +115,6 @@ pvclock_get_timecount(struct pvclock_vcpu_time_info *ti)
 		if (last > now)
 			return (last);
 	} while (!atomic_cmpset_64(&pvclock_last_cycles, last, now));
-
 	return (now);
 }
 
@@ -146,11 +124,10 @@ pvclock_get_wallclock(struct pvclock_wall_clock *wc, struct timespec *ts)
 	uint32_t version;
 
 	do {
-		version = wc->version;
-		rmb();
+		version = atomic_load_acq_32(&wc->version);
 		ts->tv_sec = wc->sec;
 		ts->tv_nsec = wc->nsec;
-		rmb();
+		atomic_thread_fence_acq();
 	} while ((wc->version & 1) != 0 || wc->version != version);
 }
 
@@ -159,7 +136,6 @@ pvclock_cdev_open(struct cdev *dev, int oflags, int devtype, struct thread *td)
 {
 	if (oflags & FWRITE)
 		return (EPERM);
-
 	return (0);
 }
 
@@ -179,7 +155,6 @@ pvclock_cdev_mmap(struct cdev *dev, vm_ooffset_t offset, vm_paddr_t *paddr,
 
 	*paddr = vtophys(dev->si_drv1);
 	*memattr = VM_MEMATTR_DEFAULT;
-
 	return (0);
 }
 
@@ -192,7 +167,6 @@ pvclock_tc_get_timecount(struct timecounter *tc)
 	critical_enter();
 	ns = pvclock_get_timecount(pvc->get_curcpu_ti(pvc->get_curcpu_ti_arg));
 	critical_exit();
-
 	return (ns & UINT_MAX);
 }
 
@@ -206,7 +180,6 @@ pvclock_tc_vdso_timehands(struct vdso_timehands *vdso_th,
 	vdso_th->th_x86_shift = 0;
 	vdso_th->th_x86_hpet_idx = 0;
 	bzero(vdso_th->th_res, sizeof(vdso_th->th_res));
-
 	return (pvc->cdev != NULL && pvc->stable_flag_supported &&
 	    (pvc->ti_vcpu0_page->flags & PVCLOCK_FLAG_TSC_STABLE) != 0);
 }
@@ -222,7 +195,6 @@ pvclock_tc_vdso_timehands32(struct vdso_timehands32 *vdso_th,
 	vdso_th->th_x86_shift = 0;
 	vdso_th->th_x86_hpet_idx = 0;
 	bzero(vdso_th->th_res, sizeof(vdso_th->th_res));
-
 	return (pvc->cdev != NULL && pvc->stable_flag_supported &&
 	    (pvc->ti_vcpu0_page->flags & PVCLOCK_FLAG_TSC_STABLE) != 0);
 }
@@ -234,38 +206,31 @@ pvclock_gettime(struct pvclock *pvc, struct timespec *ts)
 	struct timespec system_ts;
 	uint64_t system_ns;
 
-	pvclock_get_wallclock(pvc->get_wallclock(pvc->get_wallclock_arg),
-	    ts);
-
+	pvclock_get_wallclock(pvc->get_wallclock(pvc->get_wallclock_arg), ts);
 	critical_enter();
 	system_ns =
 	    pvclock_get_timecount(pvc->get_curcpu_ti(pvc->get_curcpu_ti_arg));
 	critical_exit();
-
 	system_ts.tv_sec = system_ns / 1000000000ULL;
 	system_ts.tv_nsec = system_ns % 1000000000ULL;
-
 	timespecadd(ts, &system_ts, ts);
 }
 
 void
 pvclock_init(struct pvclock *pvc, device_t dev, const char *tc_name,
-    int tc_quality, u_int tc_flags,
-    pvclock_get_curcpu_timeinfo_t *get_curcpu_ti, void *get_curcpu_ti_arg,
-    pvclock_get_wallclock_t *get_wallclock, void *get_wallclock_arg,
-    struct pvclock_vcpu_time_info *ti_vcpu0_page, bool stable_flag_supported)
+    int tc_quality, u_int tc_flags)
 {
 	struct make_dev_args mda;
 	int err;
 
-	KASSERT(((uintptr_t)ti_vcpu0_page & PAGE_MASK) == 0, ("Specified vCPU "
-	    "0 time info page address not page-aligned."));
+	KASSERT(((uintptr_t)pvc->ti_vcpu0_page & PAGE_MASK) == 0,
+	    ("Specified vCPU 0 time info page address not page-aligned."));
 
 	/* Set up timecounter and timecounter-supporting members: */
 	pvc->tc.tc_get_timecount = pvclock_tc_get_timecount;
 	pvc->tc.tc_poll_pps = NULL;
 	pvc->tc.tc_counter_mask = ~0U;
-	pvc->tc.tc_frequency = PVCLOCK_FREQUENCY_HZ;
+	pvc->tc.tc_frequency = 1000000000ULL;
 	pvc->tc.tc_name = tc_name;
 	pvc->tc.tc_quality = tc_quality;
 	pvc->tc.tc_flags = tc_flags;
@@ -274,16 +239,6 @@ pvclock_init(struct pvclock *pvc, device_t dev, const char *tc_name,
 #ifdef COMPAT_FREEBSD32
 	pvc->tc.tc_fill_vdso_timehands32 = pvclock_tc_vdso_timehands32;
 #endif
-
-	pvc->get_curcpu_ti = get_curcpu_ti;
-	pvc->get_curcpu_ti_arg = get_curcpu_ti_arg;
-
-	pvc->get_wallclock = get_wallclock;
-	pvc->get_wallclock_arg = get_wallclock_arg;
-
-	pvc->ti_vcpu0_page = ti_vcpu0_page;
-
-	pvc->stable_flag_supported = stable_flag_supported;
 
 	/* Set up cdev for userspace mmapping of vCPU 0 time info page: */
 	make_dev_args_init(&mda);
@@ -297,8 +252,8 @@ pvclock_init(struct pvclock *pvc, device_t dev, const char *tc_name,
 		device_printf(dev, "Could not create /dev/%s, error %d. Fast "
 		    "time of day will be unavailable for this timecounter.\n",
 		    PVCLOCK_CDEVNAME, err);
-		KASSERT(pvc->cdev == NULL, ("Failed make_dev_s() unexpectedly "
-		    "inited cdev."));
+		KASSERT(pvc->cdev == NULL,
+		    ("Failed make_dev_s() unexpectedly inited cdev."));
 	}
 
 	/* Register timecounter: */
@@ -307,9 +262,9 @@ pvclock_init(struct pvclock *pvc, device_t dev, const char *tc_name,
 	/*
 	 * Register wallclock:
 	 *     The RTC registration API expects a resolution in microseconds;
-	 *     'PVCLOCK_RESOLUTION_NS' is rounded up to the nearest 1us.
+	 *     pvclock's 1ns resolution is rounded up to 1us.
 	 */
-	clock_register(dev, (PVCLOCK_RESOLUTION_NS + 1000) / 1000);
+	clock_register(dev, 1);
 }
 
 int

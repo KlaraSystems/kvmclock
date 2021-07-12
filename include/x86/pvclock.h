@@ -29,6 +29,10 @@
 #ifndef X86_PVCLOCK
 #define X86_PVCLOCK
 
+#include <sys/types.h>
+#include <machine/atomic.h>
+#include <x86/rdtsc_ordered.h>
+
 #ifdef _KERNEL
 #include <sys/timetc.h>
 #endif /* _KERNEL */
@@ -62,7 +66,6 @@ pvclock_scale_delta(uint64_t delta, uint32_t mul_frac, int shift)
 		delta >>= -shift;
 	else
 		delta <<= shift;
-
 #if defined(__i386__)
 	{
 		uint32_t tmp1, tmp2;
@@ -98,7 +101,6 @@ pvclock_scale_delta(uint64_t delta, uint32_t mul_frac, int shift)
 #else
 #error "pvclock: unsupported x86 architecture?"
 #endif
-
 	return (product);
 }
 
@@ -107,8 +109,7 @@ pvclock_get_nsec_offset(struct pvclock_vcpu_time_info *ti)
 {
 	uint64_t delta;
 
-	delta = rdtsc() - ti->tsc_timestamp;
-
+	delta = rdtsc_ordered() - ti->tsc_timestamp;
 	return (pvclock_scale_delta(delta, ti->tsc_to_system_mul,
 	    ti->tsc_shift));
 }
@@ -120,11 +121,10 @@ pvclock_read_time_info(struct pvclock_vcpu_time_info *ti,
 	uint32_t version;
 
 	do {
-		version = ti->version;
-		rmb();
+		version = atomic_load_acq_32(&ti->version);
 		*ns = ti->system_time + pvclock_get_nsec_offset(ti);
 		*flags = ti->flags;
-		rmb();
+		atomic_thread_fence_acq();
 	} while ((ti->version & 1) != 0 || ti->version != version);
 }
 
@@ -140,14 +140,17 @@ struct pvclock_wall_clock {
 };
 
 struct pvclock {
-	struct timecounter		 tc;
-	struct cdev			*cdev;
+	/* Public; initialized by the caller of 'pvclock_init()': */
 	pvclock_get_curcpu_timeinfo_t	*get_curcpu_ti;
 	void				*get_curcpu_ti_arg;
 	pvclock_get_wallclock_t		*get_wallclock;
 	void				*get_wallclock_arg;
 	struct pvclock_vcpu_time_info	*ti_vcpu0_page;
 	bool				 stable_flag_supported;
+
+	/* Private; initialized by the 'pvclock' API: */
+	struct timecounter		 tc;
+	struct cdev			*cdev;
 };
 
 void		pvclock_resume(void);
@@ -158,13 +161,7 @@ void		pvclock_get_wallclock(struct pvclock_wall_clock *wc,
 		    struct timespec *ts);
 
 void		pvclock_init(struct pvclock *pvc, device_t dev,
-		    const char *tc_name, int tc_quality, u_int tc_flags,
-		    pvclock_get_curcpu_timeinfo_t *get_curcpu_ti,
-		    void *get_curcpu_ti_arg,
-		    pvclock_get_wallclock_t *get_wallclock,
-		    void *get_wallclock_arg,
-		    struct pvclock_vcpu_time_info *ti_vcpu0_page,
-		    bool stable_flag_supported);
+		    const char *tc_name, int tc_quality, u_int tc_flags);
 void		pvclock_gettime(struct pvclock *pvc, struct timespec *ts);
 int		pvclock_destroy(struct pvclock *pvc);
 

@@ -133,6 +133,39 @@ kvm_clock_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+#if __FreeBSD_version <= 1202000
+static void *
+malloc_domainset_aligned(size_t size, size_t align,
+    struct malloc_type *mtp, struct domainset *ds, int flags)
+{
+        void *res;
+        size_t asize;
+
+        KASSERT(align != 0 && powerof2(align),
+            ("malloc_domainset_aligned: wrong align %#zx size %#zx",
+            align, size));
+        KASSERT(align <= PAGE_SIZE,
+            ("malloc_domainset_aligned: align %#zx (size %#zx) too large",
+            align, size));
+
+        /*
+         * Round the allocation size up to the next power of 2,
+         * because we can only guarantee alignment for
+         * power-of-2-sized allocations.  Further increase the
+         * allocation size to align if the rounded size is less than
+         * align, since malloc zones provide alignment equal to their
+         * size.
+         */
+        asize = size <= align ? align : 1UL << flsl(size - 1);
+
+        res = malloc_domainset(asize, mtp, ds, flags);
+        KASSERT(res == NULL || ((uintptr_t)res & (align - 1)) == 0,
+            ("malloc_domainset_aligned: result not aligned %p size %#zx "
+            "allocsize %#zx align %#zx", res, size, asize, align));
+        return (res);
+}
+#endif
+
 static int
 kvm_clock_attach(device_t dev)
 {

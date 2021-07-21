@@ -31,6 +31,7 @@
 #ifndef _X86__RDTSC_ORDERED_H_
 #define _X86__RDTSC_ORDERED_H_
 
+#include <sys/param.h>
 #include <sys/types.h>
 #include <machine/cpufunc.h>
 #include <machine/cputypes.h>
@@ -74,9 +75,14 @@
     }
 
 #ifdef _KERNEL
+#if __FreeBSD_version >= 1300000
+#define KVM_IFUNC	DEFINE_IFUNC(, uint64_t, rdtsc_ordered, (void))
+#else
+#define KVM_IFUNC	DEFINE_IFUNC(, uint64_t, rdtsc_ordered, (void), static)
+#endif
 #define	DEFINE_RDTSC_ORDERED()						\
     DEFINE_RDTSC_ORDERED_COMMON()					\
-    DEFINE_IFUNC(, uint64_t, rdtsc_ordered, (void))			\
+    KVM_IFUNC								\
     {									\
     	bool cpu_is_amd = cpu_vendor_id == CPU_VENDOR_AMD ||		\
     	    cpu_vendor_id == CPU_VENDOR_HYGON;				\
@@ -85,9 +91,14 @@
     	    cpu_is_amd));						\
     }
 #else /* !_KERNEL */
+#if __FreeBSD_version >= 1300000
+#define KVM_UIFUNC	DEFINE_UIFUNC(, uint64_t, rdtsc_ordered, (void))
+#else
+#define KVM_UIFUNC	DEFINE_UIFUNC(, uint64_t, rdtsc_ordered, (void), static)
+#endif
 #define	DEFINE_RDTSC_ORDERED()						\
     DEFINE_RDTSC_ORDERED_COMMON()					\
-    DEFINE_UIFUNC(, uint64_t, rdtsc_ordered, (void))			\
+    KVM_UIFUNC								\
     {									\
     	u_int amd_feature, cpu_exthigh, p[4], v[3];			\
     	static const char amd_id[] = "AuthenticAMD";			\

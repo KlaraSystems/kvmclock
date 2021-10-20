@@ -29,6 +29,73 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include <x86/_rdtsc_ordered.h>
+#include <sys/param.h>
+#include <sys/pcpu.h>
 
-DEFINE_RDTSC_ORDERED();
+#include <machine/cputypes.h>
+#include <machine/md_var.h>
+#include <machine/specialreg.h>
+
+#include <x86/ifunc.h>
+
+static __inline void
+lfence(void)
+{
+	__asm __volatile("lfence" : : : "memory");
+}
+
+static __inline void
+mfence(void)
+{
+	__asm __volatile("mfence" : : : "memory");
+}
+
+static __inline uint64_t
+rdtsc(void)
+{
+	uint32_t low, high;
+
+	__asm __volatile("rdtsc" : "=a" (low), "=d" (high));
+	return (low | ((uint64_t)high << 32));
+}
+
+static uint64_t
+rdtsc_ordered_lfence(void)
+{
+	lfence();
+	return (rdtsc());
+}
+
+static uint64_t
+rdtsc_ordered_mfence(void)
+{
+	mfence();
+	return (rdtsc());
+}
+
+static uint64_t
+rdtscp(void)
+{
+	uint32_t low, high;
+
+	__asm __volatile("rdtscp" : "=a" (low), "=d" (high) : : "ecx");
+	return (low | ((uint64_t)high << 32));
+}
+
+#if __FreeBSD_version >= 1300000
+DEFINE_IFUNC(, uint64_t, rdtsc_ordered, (void))
+#else
+DEFINE_IFUNC(, uint64_t, rdtsc_ordered, (void), static)
+#endif
+{
+	bool cpu_is_amd = cpu_vendor_id == CPU_VENDOR_AMD ||
+	    cpu_vendor_id == CPU_VENDOR_HYGON;
+
+	if ((amd_feature & AMDID_RDTSCP) != 0)
+		return (rdtscp);
+	else if ((cpu_feature & CPUID_SSE2) != 0)
+		return (cpu_is_amd ? rdtsc_ordered_mfence :
+		    rdtsc_ordered_lfence);
+	else
+		return (rdtsc);
+}

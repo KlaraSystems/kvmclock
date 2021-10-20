@@ -49,6 +49,7 @@ __FBSDID("$FreeBSD$");
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_extern.h>
 
 #include <machine/pvclock.h>
 #include <x86/kvm.h>
@@ -73,18 +74,9 @@ struct kvm_clock_softc {
 
 static devclass_t	kvm_clock_devclass;
 
-static struct pvclock_vcpu_time_info *kvm_clock_get_curcpu_timeinfo(void *arg);
 static struct pvclock_wall_clock *kvm_clock_get_wallclock(void *arg);
 static void	kvm_clock_system_time_enable(struct kvm_clock_softc *sc);
 static void	kvm_clock_system_time_enable_pcpu(void *arg);
-
-static struct pvclock_vcpu_time_info *
-kvm_clock_get_curcpu_timeinfo(void *arg)
-{
-	struct pvclock_vcpu_time_info *timeinfos = arg;
-
-	return (&timeinfos[curcpu]);
-}
 
 static struct pvclock_wall_clock *
 kvm_clock_get_wallclock(void *arg)
@@ -118,8 +110,8 @@ kvm_clock_identify(driver_t *driver, device_t parent)
 	u_int regs[4];
 
 	kvm_cpuid_get_features(regs);
-	if ((regs[0] & KVM_FEATURE_CLOCKSOURCE2) == 0 &&
-	    (regs[0] & KVM_FEATURE_CLOCKSOURCE) == 0)
+	if ((regs[0] &
+	    (KVM_FEATURE_CLOCKSOURCE2 | KVM_FEATURE_CLOCKSOURCE)) == 0)
 		return;
 	if (device_find_child(parent, KVM_CLOCK_DEVNAME, -1))
 		return;
@@ -133,39 +125,6 @@ kvm_clock_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
-#if __FreeBSD_version <= 1202000
-static void *
-malloc_domainset_aligned(size_t size, size_t align,
-    struct malloc_type *mtp, struct domainset *ds, int flags)
-{
-        void *res;
-        size_t asize;
-
-        KASSERT(align != 0 && powerof2(align),
-            ("malloc_domainset_aligned: wrong align %#zx size %#zx",
-            align, size));
-        KASSERT(align <= PAGE_SIZE,
-            ("malloc_domainset_aligned: align %#zx (size %#zx) too large",
-            align, size));
-
-        /*
-         * Round the allocation size up to the next power of 2,
-         * because we can only guarantee alignment for
-         * power-of-2-sized allocations.  Further increase the
-         * allocation size to align if the rounded size is less than
-         * align, since malloc zones provide alignment equal to their
-         * size.
-         */
-        asize = size <= align ? align : 1UL << flsl(size - 1);
-
-        res = malloc_domainset(asize, mtp, ds, flags);
-        KASSERT(res == NULL || ((uintptr_t)res & (align - 1)) == 0,
-            ("malloc_domainset_aligned: result not aligned %p size %#zx "
-            "allocsize %#zx align %#zx", res, size, asize, align));
-        return (res);
-}
-#endif
-
 static int
 kvm_clock_attach(device_t dev)
 {
@@ -178,18 +137,19 @@ kvm_clock_attach(device_t dev)
 	if ((regs[0] & KVM_FEATURE_CLOCKSOURCE2) != 0) {
 		sc->msr_tc = KVM_MSR_SYSTEM_TIME_NEW;
 		sc->msr_wc = KVM_MSR_WALL_CLOCK_NEW;
-	} else if ((regs[0] & KVM_FEATURE_CLOCKSOURCE) != 0) {
+	} else {
+		KASSERT((regs[0] & KVM_FEATURE_CLOCKSOURCE) != 0,
+		    ("Clocksource feature flags disappeared since "
+		    "kvm_clock_identify: regs[0] %#0x.", regs[0]));
 		sc->msr_tc = KVM_MSR_SYSTEM_TIME;
 		sc->msr_wc = KVM_MSR_WALL_CLOCK;
-	} else
-		return (ENXIO);
+	}
 	stable_flag_supported =
-	    ((regs[0] & KVM_FEATURE_CLOCKSOURCE_STABLE_BIT) != 0);
+	    (regs[0] & KVM_FEATURE_CLOCKSOURCE_STABLE_BIT) != 0;
 
 	/* Set up 'struct pvclock_vcpu_time_info' page(s): */
-	sc->timeinfos = malloc_domainset_aligned(round_page(mp_ncpus *
-	    sizeof(struct pvclock_vcpu_time_info)), PAGE_SIZE, M_DEVBUF,
-	    DOMAINSET_RR(), M_WAITOK | M_ZERO);
+	sc->timeinfos = (struct pvclock_vcpu_time_info *)kmem_malloc(mp_ncpus *
+	    sizeof(struct pvclock_vcpu_time_info), M_WAITOK | M_ZERO);
 	kvm_clock_system_time_enable(sc);
 
 	/*
@@ -201,11 +161,9 @@ kvm_clock_attach(device_t dev)
 	 *     leave 'TC_FLAGS_SUSPEND_SAFE' cleared and assume that the system
 	 *     time must be re-inited in such cases.
 	 */
-	sc->pvc.get_curcpu_ti = kvm_clock_get_curcpu_timeinfo;
-	sc->pvc.get_curcpu_ti_arg = sc->timeinfos;
 	sc->pvc.get_wallclock = kvm_clock_get_wallclock;
 	sc->pvc.get_wallclock_arg = sc;
-	sc->pvc.ti_vcpu0_page = sc->timeinfos;
+	sc->pvc.timeinfos = sc->timeinfos;
 	sc->pvc.stable_flag_supported = stable_flag_supported;
 	pvclock_init(&sc->pvc, dev, KVM_CLOCK_DEVNAME, KVM_CLOCK_TC_QUALITY, 0);
 	return (0);

@@ -30,8 +30,6 @@
 #define X86_PVCLOCK
 
 #include <sys/types.h>
-#include <machine/atomic.h>
-#include <x86/rdtsc_ordered.h>
 
 #ifdef _KERNEL
 #include <sys/timetc.h>
@@ -104,33 +102,8 @@ pvclock_scale_delta(uint64_t delta, uint32_t mul_frac, int shift)
 	return (product);
 }
 
-static inline uint64_t
-pvclock_get_nsec_offset(struct pvclock_vcpu_time_info *ti)
-{
-	uint64_t delta;
-
-	delta = rdtsc_ordered() - ti->tsc_timestamp;
-	return (pvclock_scale_delta(delta, ti->tsc_to_system_mul,
-	    ti->tsc_shift));
-}
-
-static inline void
-pvclock_read_time_info(struct pvclock_vcpu_time_info *ti,
-    uint64_t *ns, uint8_t *flags)
-{
-	uint32_t version;
-
-	do {
-		version = atomic_load_acq_32(&ti->version);
-		*ns = ti->system_time + pvclock_get_nsec_offset(ti);
-		*flags = ti->flags;
-		atomic_thread_fence_acq();
-	} while ((ti->version & 1) != 0 || ti->version != version);
-}
-
 #ifdef _KERNEL
 
-typedef struct pvclock_vcpu_time_info *pvclock_get_curcpu_timeinfo_t(void *arg);
 typedef struct pvclock_wall_clock *pvclock_get_wallclock_t(void *arg);
 
 struct pvclock_wall_clock {
@@ -141,20 +114,23 @@ struct pvclock_wall_clock {
 
 struct pvclock {
 	/* Public; initialized by the caller of 'pvclock_init()': */
-	pvclock_get_curcpu_timeinfo_t	*get_curcpu_ti;
-	void				*get_curcpu_ti_arg;
 	pvclock_get_wallclock_t		*get_wallclock;
 	void				*get_wallclock_arg;
-	struct pvclock_vcpu_time_info	*ti_vcpu0_page;
+	struct pvclock_vcpu_time_info	*timeinfos;
 	bool				 stable_flag_supported;
 
 	/* Private; initialized by the 'pvclock' API: */
+	bool				 vdso_force_unstable;
 	struct timecounter		 tc;
 	struct cdev			*cdev;
 };
 
+/*
+ * NOTE: 'pvclock_get_timecount()' and 'pvclock_get_wallclock()' are purely
+ * transitional; they should be removed after 'dev/xen/timer/timer.c' has been
+ * migrated to the 'struct pvclock' API.
+ */
 void		pvclock_resume(void);
-uint64_t	pvclock_get_last_cycles(void);
 uint64_t	pvclock_tsc_freq(struct pvclock_vcpu_time_info *ti);
 uint64_t	pvclock_get_timecount(struct pvclock_vcpu_time_info *ti);
 void		pvclock_get_wallclock(struct pvclock_wall_clock *wc,
